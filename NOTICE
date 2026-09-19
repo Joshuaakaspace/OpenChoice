@@ -1,0 +1,52 @@
+OpenChoice
+==========
+
+OpenChoice is a derivative work. It is an independent, embeddable
+reimplementation of the model/hardware fit problem first solved by:
+
+    llmfit — https://github.com/AlexsJones/llmfit
+    Copyright (c) 2026 Alex Jones
+    MIT License
+
+Both projects are MIT licensed, and the upstream copyright notice is retained
+in this repository's LICENSE file as that license requires.
+
+What was taken
+--------------
+
+OpenChoice is not a fork of the llmfit source tree; no llmfit source file is
+copied into this repository. What it does carry forward is the reasoning,
+which is the genuinely hard-won part of that project:
+
+  * The idea that a fit verdict should be a pure function of memory-pool
+    utilisation, capped by what the execution path can deliver, rather than a
+    blend of several overlapping signals.
+  * The verdict bands themselves (60% / 85% / 98%) and the reasoning for
+    stopping the top band short of 100%.
+  * The observation that decode is memory-bandwidth-bound and prefill is
+    compute-bound, and that the two must be estimated separately — including
+    reporting an unknown prefill as null rather than zero.
+  * The bandwidth-roofline decode formula and its 0.55 efficiency derate.
+  * Walking a quantization hierarchy to find the best format that fits,
+    instead of assuming one.
+  * Treating usable context as distinct from a model's advertised window.
+  * Per-use-case scoring weights across quality, speed, fit, and context.
+
+The GPU bandwidth and fp16 throughput figures in `openchoice-core` were
+compiled independently from vendor specifications.
+
+What is new here
+----------------
+
+  * The `.ocb` packed catalog format and its zero-copy, allocation-free
+    reader, which is what makes the catalog fit in microcontroller flash.
+  * A `no_std`, dependency-free, allocation-free engine (`openchoice-core`)
+    that builds for bare-metal RISC-V and Xtensa targets.
+  * The device console (`openchoice-embedded`) and ESP32 firmware.
+  * Recalibrated capability scoring, cross-domain alignment penalties, and
+    collapsing of repackaged duplicates in the ranking.
+
+If you want the full-featured desktop tool — the TUI, the web dashboard, the
+REST API, community benchmark sharing, the Kubernetes DRA integration — use
+llmfit. It does considerably more than this does. OpenChoice exists to answer
+the same question in 57 KB of code on a device with no operating system.

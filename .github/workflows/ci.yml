@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  embedded:
+    name: Bare-metal build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv32imc-unknown-none-elf
+      - uses: Swatinem/rust-cache@v2
+      # The claim this project rests on: the engine builds with no operating
+      # system underneath it. If this job breaks, the product is broken.
+      - name: Engine builds for bare-metal RISC-V
+        run: cargo build --release --target riscv32imc-unknown-none-elf -p openchoice-core -p openchoice-embedded
+
+  firmware:
+    name: ESP32-C3 firmware
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv32imc-unknown-none-elf
+          components: llvm-tools
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        working-directory: firmware/esp32c3
+        run: cargo build --release
+      - name: Report size
+        working-directory: firmware/esp32c3
+        run: |
+          SIZE=$(find "$(rustc --print sysroot)" -name llvm-size | head -1)
+          "$SIZE" -A target/riscv32imc-unknown-none-elf/release/openchoice-esp32c3

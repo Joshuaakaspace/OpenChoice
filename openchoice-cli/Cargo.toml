@@ -1,0 +1,18 @@
+[package]
+name = "openchoice"
+description = "Right-size open LLMs to your hardware. Desktop CLI for the OpenChoice fit engine."
+keywords = ["llm", "hardware", "inference", "cli", "gguf"]
+categories = ["command-line-utilities"]
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "openchoice"
+path = "src/main.rs"
+
+[dependencies]
+openchoice-core = { version = "0.1.0", path = "../openchoice-core" }
+sysinfo = "0.37"

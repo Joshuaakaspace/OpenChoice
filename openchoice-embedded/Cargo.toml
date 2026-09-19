@@ -1,0 +1,11 @@
+[package]
+name = "openchoice-embedded"
+description = "no_std device console for OpenChoice: parse a query, render a fit report, no allocator."
+categories = ["embedded", "no-std"]
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+openchoice-core = { version = "0.1.0", path = "../openchoice-core" }

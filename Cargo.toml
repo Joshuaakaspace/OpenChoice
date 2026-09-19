@@ -1,0 +1,19 @@
+[workspace]
+members = ["openchoice-core", "openchoice-catalog", "openchoice-cli", "openchoice-embedded"]
+default-members = ["openchoice-core", "openchoice-catalog", "openchoice-cli", "openchoice-embedded"]
+resolver = "2"
+exclude = ["firmware/esp32c3"]
+
+[workspace.package]
+version = "0.1.0"
+license = "MIT"
+edition = "2021"
+repository = "https://github.com/Joshuaakaspace/OpenChoice"
+homepage = "https://github.com/Joshuaakaspace/OpenChoice"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

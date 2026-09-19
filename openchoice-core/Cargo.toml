@@ -1,0 +1,20 @@
+[package]
+name = "openchoice-core"
+description = "no_std fit engine: does this LLM run on this hardware? Zero dependencies, zero allocation."
+keywords = ["llm", "embedded", "no-std", "hardware", "inference"]
+categories = ["embedded", "no-std", "hardware-support"]
+readme = "README.md"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = ["gpu-db"]
+# Name -> memory-bandwidth/compute lookup for ~90 GPUs. ~6 KB of .rodata.
+# Disable on tight flash budgets and supply bandwidth numerically instead.
+gpu-db = []
+
+[dependencies]
+# Intentionally none. This crate must build for any target with a float ABI.

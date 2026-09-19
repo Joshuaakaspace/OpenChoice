@@ -1,0 +1,21 @@
+[package]
+name = "openchoice-esp32c3"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "OpenChoice firmware for ESP32-C3: an offline LLM fit oracle over USB serial."
+
+[dependencies]
+openchoice-core = { path = "../../openchoice-core" }
+openchoice-embedded = { path = "../../openchoice-embedded" }
+esp-hal = { version = "1.2", features = ["esp32c3", "unstable"] }
+esp-backtrace = { version = "0.20", features = ["esp32c3", "panic-handler", "println"] }
+esp-println = { version = "0.18", default-features = false, features = ["esp32c3", "jtag-serial", "critical-section"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+overflow-checks = false
+
+[workspace]

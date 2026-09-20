@@ -117,6 +117,10 @@ pub struct Hardware {
     /// Memory the OS and other processes are assumed to hold, MiB. Subtracted
     /// from the CPU pool before any verdict is computed.
     pub os_reserve_mb: u32,
+    /// Identity of this machine for looking up real measurements, from
+    /// [`crate::catalog::hw_key`]. Zero means "unidentified", which simply
+    /// means no measurement or calibration will be found — never a wrong one.
+    pub hw_key: u32,
 }
 
 impl Hardware {
@@ -136,6 +140,7 @@ impl Hardware {
             ram_bandwidth_gbps: 0,
             tflops_fp16_x10: 0,
             os_reserve_mb: 2048,
+            hw_key: 0,
         }
     }
 
@@ -151,9 +156,16 @@ impl Hardware {
         if self.ram_bandwidth_gbps > 0 {
             self.ram_bandwidth_gbps as f32
         } else if self.unified {
-            // A unified system with no stated bandwidth is still far better
-            // than socketed DDR; Apple's slowest unified parts start here.
-            100.0
+            // On a unified system the CPU and GPU read the same memory over
+            // the same controller, so if the accelerator's bandwidth is known
+            // that IS the system bandwidth. Falling back to a DDR-ish default
+            // here understated Apple Silicon by 2-8x on any model that spilled
+            // out of the wired limit.
+            if self.gpu_bandwidth_gbps > 0 {
+                self.gpu_bandwidth_gbps as f32
+            } else {
+                100.0
+            }
         } else {
             51.2
         }

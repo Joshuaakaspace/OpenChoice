@@ -52,6 +52,10 @@ pub enum RunMode {
     MoeOffload = 1,
     /// Split across accelerator and system memory.
     CpuGpu = 2,
+    /// Unified memory, but past the share the GPU may wire. Compute still runs
+    /// on the accelerator — there is only one pool — but the OS is now paging
+    /// against it, which is a different proposition from a comfortable fit.
+    UnifiedSpill = 4,
     /// Entirely in system RAM.
     Cpu = 3,
 }
@@ -62,6 +66,7 @@ impl RunMode {
             RunMode::Gpu => "GPU",
             RunMode::MoeOffload => "MoE offload",
             RunMode::CpuGpu => "CPU+GPU",
+            RunMode::UnifiedSpill => "unified, over wired limit",
             RunMode::Cpu => "CPU",
         }
     }
@@ -291,9 +296,11 @@ pub fn evaluate_at(model: &Model, hw: &Hardware, opts: &Opts, quant: Quant, cont
             (RunMode::CpuGpu, vram + usable_ram, full_resident, 0)
         }
     } else if hw.unified {
-        // VRAM and RAM are the same silicon. Spilling buys nothing, so the
-        // only honest fallback is the CPU path against the same pool.
-        (RunMode::Cpu, usable_ram, full_resident, 0)
+        // VRAM and RAM are the same silicon, so there is nothing to spill
+        // *into* — the model simply exceeds what the OS lets the GPU wire and
+        // starts paging. Calling that "CPU" misdescribes an Apple Silicon
+        // machine, which has no separate CPU path to fall back to.
+        (RunMode::UnifiedSpill, usable_ram, full_resident, 0)
     } else {
         (RunMode::CpuGpu, vram + usable_ram, full_resident, 0)
     };

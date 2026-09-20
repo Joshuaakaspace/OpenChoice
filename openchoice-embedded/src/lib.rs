@@ -16,8 +16,8 @@
 use core::fmt::Write;
 
 use openchoice_core::{
-    evaluate_model, recommend, Backend, Catalog, Filter, Hardware, KvQuant, Opts, Recommendation,
-    UseCase, Verdict,
+    evaluate_model, recommend, Backend, Catalog, EstimateMethod, Filter, Hardware, KvQuant, Opts,
+    Recommendation, UseCase, Verdict,
 };
 
 /// A fixed-capacity `core::fmt::Write` sink.
@@ -136,6 +136,7 @@ impl Console {
                 ram_bandwidth_gbps: 0,
                 tflops_fp16_x10: 0,
                 os_reserve_mb: 2048,
+                hw_key: 0,
             },
             opts: Opts {
                 context: None,
@@ -217,6 +218,7 @@ impl Console {
                 self.hardware.tflops_fp16_x10 = 0;
                 self.hardware.unified = false;
                 self.hardware.backend = Backend::CpuX86;
+                self.hardware.hw_key = 0;
                 let _ = write!(out, "scoring against system RAM only");
                 Outcome::Ok
             }
@@ -329,6 +331,9 @@ impl Console {
             let _ = write!(out, "gpu <name>, e.g. `gpu rtx 4090`");
             return;
         }
+        // Naming the machine is also what unlocks any real measurements taken
+        // on it, which is worth more than the bandwidth lookup.
+        self.hardware.hw_key = openchoice_core::hw_key(name);
         match openchoice_core::lookup_gpu(name) {
             Some((bw, tf)) => {
                 self.hardware.gpu_bandwidth_gbps = bw;
@@ -397,19 +402,35 @@ impl Console {
 
         let _ = writeln!(
             out,
-            "{:<28}{:>8}{:>7}{:>9}",
+            "{:<26}{:>8}{:>8}{:>9}",
             "MODEL", "QUANT", "TOK/S", "FIT"
         );
+        let mut any_measured = false;
         for rec in top.iter().take(self.limit) {
             let tps = rec.speed.decode_tps_x10 as f32 / 10.0;
+            // The same provenance mark the desktop table carries. A device
+            // with a two-inch window has less room to explain itself, not
+            // less duty to separate a measured number from a guessed one.
+            let mark = match rec.speed.method {
+                EstimateMethod::Measured => '*',
+                EstimateMethod::MeasuredAdjusted => '^',
+                EstimateMethod::Calibrated => '+',
+                EstimateMethod::Roofline => ' ',
+                EstimateMethod::BackendConstant => '~',
+            };
+            any_measured |= mark != ' ';
             let _ = writeln!(
                 out,
-                "{:<28}{:>8}{:>7.1}{:>9}",
-                trunc(rec.model.name(), 27),
+                "{:<26}{:>8}{:>7.1}{}{:>8}",
+                trunc(rec.model.name(), 25),
                 rec.fit.quant.name(),
                 tps,
+                mark,
                 rec.fit.verdict.name()
             );
+        }
+        if any_measured {
+            let _ = writeln!(out, "* measured here  ^ rescaled  + calibrated");
         }
         if out.overflowed() {
             let _ = write!(out, "\n(truncated — lower `limit`)");
@@ -425,7 +446,7 @@ impl Console {
             let _ = write!(out, "no model matching \"{query}\"");
             return;
         };
-        let rec = evaluate_model(&model, &self.hardware, &self.opts);
+        let rec = evaluate_model(catalog, &model, &self.hardware, &self.opts);
         render_detail(&rec, out);
     }
 }

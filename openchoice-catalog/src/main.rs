@@ -12,12 +12,17 @@
 //! openchoice-catalog inspect catalog/openchoice.ocb
 //! ```
 
+mod community;
+
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::ExitCode;
 
-use openchoice_core::catalog::{flags, FORMAT_VERSION, HEADER_LEN, MAGIC, RECORD_LEN};
-use openchoice_core::{Catalog, UseCase};
+use openchoice_core::catalog::{
+    flags, CALIBRATION_LEN, FORMAT_VERSION, HEADER_LEN, MAGIC, MEASUREMENT_LEN, RECORD_LEN,
+};
+use openchoice_core::{Catalog, Opts, Quant, UseCase};
 
 /// One entry as it appears in the source JSON. Everything is optional because
 /// the scraper cannot always resolve a model's config, and a missing field
@@ -99,6 +104,8 @@ struct Args {
     top: Option<usize>,
     min_downloads: u64,
     include_all_pipelines: bool,
+    community: Option<String>,
+    show_unmatched: bool,
     path: Option<String>,
 }
 
@@ -112,6 +119,8 @@ fn parse_args() -> Result<Args, String> {
         top: None,
         min_downloads: 1000,
         include_all_pipelines: false,
+        community: None,
+        show_unmatched: false,
         path: None,
     };
     while let Some(flag) = raw.next() {
@@ -134,6 +143,8 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| "--min-downloads must be a number")?
             }
             "--all-pipelines" => args.include_all_pipelines = true,
+            "--community" => args.community = raw.next(),
+            "--show-unmatched" => args.show_unmatched = true,
             other if !other.starts_with('-') && args.path.is_none() => {
                 args.path = Some(other.to_string())
             }
@@ -212,7 +223,19 @@ fn build(args: &Args) -> Result<(), String> {
         kept.truncate(n);
     }
 
-    let bytes = pack(&kept)?;
+    // Pack once without measurements so the community importer has a real
+    // catalog to resolve model names against and to predict throughput from.
+    let base = pack(&kept, &[], &[])?;
+    let ingested = match args.community.as_deref() {
+        Some(dir) => Some(import_community(dir, &base, args.show_unmatched)?),
+        None => None,
+    };
+
+    let (measurements, calibrations) = match &ingested {
+        Some(i) => (i.measurements.as_slice(), i.calibrations.as_slice()),
+        None => (&[][..], &[][..]),
+    };
+    let bytes = pack(&kept, measurements, calibrations)?;
     std::fs::write(output, &bytes).map_err(|e| format!("writing {output}: {e}"))?;
 
     // Round-trip immediately. A catalog that does not parse is worse than no
@@ -235,7 +258,73 @@ fn build(args: &Args) -> Result<(), String> {
         bytes.len() / kept.len().max(1),
         raw.len() as f64 / 1_048_576.0
     );
+    if let Some(i) = &ingested {
+        println!(
+            "  {} measurements from {} submissions — {} of {} results matched a catalog model",
+            i.measurements.len(),
+            i.files,
+            i.matched,
+            i.results
+        );
+        println!(
+            "  {} machines seen, {} with enough samples for a calibration factor",
+            i.machines,
+            i.calibrations.len()
+        );
+    }
     Ok(())
+}
+
+/// Resolve community submissions against the catalog we just packed.
+///
+/// The prediction closure runs the real engine, so a calibration factor is the
+/// ratio between what this code would have said and what actually happened —
+/// not a ratio against some other formula that has since drifted.
+fn import_community(
+    dir: &str,
+    base: &[u8],
+    show_unmatched: bool,
+) -> Result<community::Ingested, String> {
+    let catalog = Catalog::parse(base).map_err(|e| format!("internal: {e:?}"))?;
+
+    let mut index_by_key: HashMap<String, u32> = HashMap::new();
+    for model in catalog.iter() {
+        // Models are packed most-downloaded first, so the first entry to claim
+        // a key is the canonical one and later repackages do not displace it.
+        index_by_key
+            .entry(community::normalize_model(model.name()))
+            .or_insert(model.index());
+    }
+
+    let predict =
+        |hw: &openchoice_core::Hardware, index: u32, quant: Option<Quant>| -> Option<f64> {
+            let model = catalog.get(index as usize)?;
+            let opts = Opts {
+                // Benchmarks use short prompts; scoring at the model's full native
+                // window would charge a KV cache the run never allocated.
+                context: Some(4096),
+                ..Default::default()
+            };
+            let fit = match quant {
+                Some(q) => openchoice_core::fit::evaluate_at(&model, hw, &opts, q, 4096),
+                None => openchoice_core::fit::evaluate(&model, hw, &opts),
+            };
+            let speed = openchoice_core::speed::estimate(&model, hw, &fit, opts.efficiency);
+            Some(speed.decode_tps_x10 as f64 / 10.0)
+        };
+
+    let ingested = community::ingest(Path::new(dir), &index_by_key, predict)?;
+
+    if show_unmatched {
+        eprintln!(
+            "
+benchmark names that matched no catalog model:"
+        );
+        for (name, count) in ingested.unmatched.iter().take(40) {
+            eprintln!("  {count:3}  {name}");
+        }
+    }
+    Ok(ingested)
 }
 
 /// Whether a source entry earns a slot.
@@ -272,7 +361,11 @@ fn keep(m: &SourceModel, min_downloads: u64, all_pipelines: bool) -> bool {
     true
 }
 
-fn pack(models: &[SourceModel]) -> Result<Vec<u8>, String> {
+fn pack(
+    models: &[SourceModel],
+    measurements: &[community::PackedMeasurement],
+    calibrations: &[(u32, u16, u8)],
+) -> Result<Vec<u8>, String> {
     // Deduplicated string table. Model names repeat their org prefix often
     // enough that interning is worth the HashMap.
     let mut strings: Vec<u8> = Vec::new();
@@ -362,11 +455,37 @@ fn pack(models: &[SourceModel]) -> Result<Vec<u8>, String> {
         records.push(reputation_prior(m));
     }
 
+    // Measurement section: 16 bytes each, already sorted by (hw_key, index)
+    // so the reader can binary search without building anything.
+    let mut meas = Vec::with_capacity(measurements.len() * MEASUREMENT_LEN);
+    for m in measurements {
+        meas.extend_from_slice(&m.hw_key.to_le_bytes());
+        meas.extend_from_slice(&m.model_index.to_le_bytes());
+        meas.extend_from_slice(&m.tps_x10.to_le_bytes());
+        meas.extend_from_slice(&m.ttft_ms.to_le_bytes());
+        meas.push(m.quant);
+        meas.push(m.runs);
+        meas.push(m.provider);
+        meas.push(0); // flags, reserved
+    }
+
+    // Calibration section: 8 bytes each, sorted by hw_key.
+    let mut cal = Vec::with_capacity(calibrations.len() * CALIBRATION_LEN);
+    for (hw, factor, samples) in calibrations {
+        cal.extend_from_slice(&hw.to_le_bytes());
+        cal.extend_from_slice(&factor.to_le_bytes());
+        cal.push(*samples);
+        cal.push(0); // flags, reserved
+    }
+
     let record_count = models.len() as u32;
     let rec_off = HEADER_LEN as u32;
     let str_off = rec_off + records.len() as u32;
+    let meas_off = str_off + strings.len() as u32;
+    let cal_off = meas_off + meas.len() as u32;
 
-    let mut out = Vec::with_capacity(HEADER_LEN + records.len() + strings.len());
+    let mut out =
+        Vec::with_capacity(HEADER_LEN + records.len() + strings.len() + meas.len() + cal.len());
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&(RECORD_LEN as u16).to_le_bytes());
@@ -374,11 +493,17 @@ fn pack(models: &[SourceModel]) -> Result<Vec<u8>, String> {
     out.extend_from_slice(&rec_off.to_le_bytes());
     out.extend_from_slice(&str_off.to_le_bytes());
     out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    out.extend_from_slice(&meas_off.to_le_bytes());
+    out.extend_from_slice(&(measurements.len() as u32).to_le_bytes());
+    out.extend_from_slice(&cal_off.to_le_bytes());
+    out.extend_from_slice(&(calibrations.len() as u32).to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // flags, reserved
     out.extend_from_slice(&0u32.to_le_bytes()); // checksum, reserved
     debug_assert_eq!(out.len(), HEADER_LEN);
     out.extend_from_slice(&records);
     out.extend_from_slice(&strings);
+    out.extend_from_slice(&meas);
+    out.extend_from_slice(&cal);
     Ok(out)
 }
 
@@ -467,6 +592,11 @@ fn inspect(args: &Args) -> Result<(), String> {
         Catalog::parse(&bytes).map_err(|e| format!("{path} is not a valid catalog: {e:?}"))?;
 
     println!("{path}: {} models, {} bytes", catalog.len(), bytes.len());
+    println!(
+        "  {} real measurements, {} machines with a calibration factor",
+        catalog.measurement_count(),
+        catalog.calibration_count()
+    );
     let mut moe = 0usize;
     let mut with_arch = 0usize;
     for m in catalog.iter() {

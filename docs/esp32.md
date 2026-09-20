@@ -24,7 +24,7 @@ in one step.
 ## Using it
 
 ```
-OpenChoice — 1500 models in 93 KB of flash
+OpenChoice — 1500 models in 98 KB of flash
 type `help`, or `go` to rank for the default machine
 
 openchoice> gpu rtx 4090
@@ -35,11 +35,18 @@ vram = 24576
 openchoice> ram 65536
 ram = 65536
 openchoice> go
-MODEL                          QUANT  TOK/S      FIT
-openai/gpt-oss-20b              Q8_0   68.2     Good
-microsoft/phi-4                 Q8_0   32.1     Good
-...
+MODEL                        QUANT   TOK/S      FIT
+openai/gpt-oss-20b            Q8_0   22.3^    Good
+openai/gpt-oss-safeguard-     Q8_0   21.1+    Good
+Qwen/Qwen3.6-35B-A3B-FP8      Q6_K   36.0^Marginal
+* measured here  ^ rescaled  + calibrated
 ```
+
+The mark after each speed says where the number came from: `*` measured on
+this exact hardware, `^` measured here at another quantization and rescaled,
+`+` formula corrected by measurements from this machine, blank a plain
+bandwidth roofline, `~` a backend constant. The device makes the same
+distinctions the desktop tool does.
 
 | Command | Does |
 |---|---|
@@ -71,9 +78,9 @@ Measured with `llvm-size` on the release build with the 1,500-model catalog:
 
 | Section | Bytes |
 |---|---:|
-| `.text` | 58,706 |
-| `.rodata` | 113,392 |
-| `.data` | 1,420 |
+| `.text` | 60,298 |
+| `.rodata` | 118,688 |
+| `.data` | 1,476 |
 | `.bss` | 440 |
 
 **440 bytes of static RAM.** The engine never allocates: the catalog is read
@@ -81,16 +88,21 @@ in place out of flash, and the only sizeable buffer is the `ReportBuf<2048>`
 the firmware owns on the stack. Ranking all 1,500 models keeps only the best
 32 results, in a fixed array, in one pass.
 
+That figure includes the 309 real benchmark measurements the default catalog
+carries. They are looked up by binary search straight out of flash, so
+carrying them costs 1.6 KB of code and 5 KB of `.rodata` and moves `.bss` not
+at all.
+
 ### Sizing the catalog
 
-The firmware embeds `catalog/openchoice-tiny.ocb` (1,500 models, 93 KB). To
+The firmware embeds `catalog/openchoice-tiny.ocb` (1,500 models, 98 KB, 309 measurements). To
 change it, build a different one and rebuild:
 
 ```sh
 cargo run -p openchoice-catalog -- build -i hf_models.json -o catalog/openchoice-tiny.ocb --top 3000
 ```
 
-Even the full 252 KB catalog leaves a 4 MB part around 90% empty, so `--top`
+Even the full 258 KB catalog leaves a 4 MB part around 90% empty, so `--top`
 is about taste, not necessity, unless your partition table is unusual.
 
 ## Xtensa parts (ESP32, ESP32-S2, ESP32-S3)

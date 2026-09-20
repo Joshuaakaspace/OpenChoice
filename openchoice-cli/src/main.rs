@@ -181,6 +181,9 @@ fn apply_overrides(mut hw: Hardware, cli: &Cli) -> (Hardware, Option<String>) {
     let mut name = None;
     if let Some(gpu) = cli.gpu_override.as_deref() {
         name = Some(gpu.to_string());
+        // Scoring against a different machine means looking up that machine's
+        // measurements, not the one we are sitting at.
+        hw.hw_key = openchoice_core::hw_key(gpu);
         match openchoice_core::lookup_gpu(gpu) {
             Some((bw, tf)) => {
                 hw.gpu_bandwidth_gbps = bw;
@@ -313,7 +316,12 @@ fn cmd_recommend(args: &[String]) -> Result<(), String> {
 fn print_row(rec: &Recommendation) {
     let m = &rec.model;
     let tps = rec.speed.decode_tps_x10 as f32 / 10.0;
+    // One character of provenance next to every speed. A measured number and
+    // a guessed one must not look identical in a table people skim.
     let marker = match rec.speed.method {
+        openchoice_core::EstimateMethod::Measured => '*',
+        openchoice_core::EstimateMethod::MeasuredAdjusted => '^',
+        openchoice_core::EstimateMethod::Calibrated => '+',
         openchoice_core::EstimateMethod::Roofline => ' ',
         openchoice_core::EstimateMethod::BackendConstant => '~',
     };
@@ -345,7 +353,7 @@ fn cmd_fit(args: &[String]) -> Result<(), String> {
 
     let detected = detect::detect();
     let (hw, _) = apply_overrides(detected.hardware, &cli);
-    let rec = evaluate_model(&model, &hw, &cli.opts);
+    let rec = evaluate_model(&catalog, &model, &hw, &cli.opts);
 
     if cli.json {
         print_json(std::iter::once(&rec));
@@ -400,13 +408,62 @@ fn cmd_fit(args: &[String]) -> Result<(), String> {
         fmt_tokens(model.context_length())
     );
     println!();
-    println!(
-        "  decode      {:.1} tok/s  ({} at {} GB/s, {:.0}% efficiency)",
-        rec.speed.decode_tps_x10 as f32 / 10.0,
-        rec.speed.method.name(),
-        rec.speed.bandwidth_gbps,
-        rec.speed.efficiency * 100.0
-    );
+    match (&rec.speed.measurement, rec.speed.calibration) {
+        (Some(m), _) => {
+            let exact = rec.speed.method == openchoice_core::EstimateMethod::Measured;
+            println!(
+                "  decode      {:.1} tok/s  {}",
+                rec.speed.decode_tps_x10 as f32 / 10.0,
+                if exact {
+                    "MEASURED on this hardware"
+                } else {
+                    "measured on this hardware, rescaled to this quantization"
+                }
+            );
+            println!(
+                "              {:.1} tok/s observed over {} run(s) via {}{}",
+                m.tps(),
+                m.runs,
+                m.provider.name(),
+                match m.quant {
+                    Some(q) => format!(" at {}", q.name()),
+                    None => String::new(),
+                }
+            );
+            if m.ttft_ms > 0 {
+                println!(
+                    "              {} ms to first token in that run (prompt length not recorded)",
+                    m.ttft_ms
+                );
+            }
+            // Show what the formula would have said, so the estimator can be
+            // judged against the measurement instead of quietly replaced by it.
+            let bare =
+                openchoice_core::speed::estimate(&rec.model, &hw, &rec.fit, rec.speed.efficiency);
+            println!(
+                "              (the formula alone would have said {:.1} tok/s)",
+                bare.decode_tps_x10 as f32 / 10.0
+            );
+        }
+        (None, Some((factor, samples))) => {
+            println!(
+                "  decode      {:.1} tok/s  (roofline at {} GB/s, then scaled {:.2}x",
+                rec.speed.decode_tps_x10 as f32 / 10.0,
+                rec.speed.bandwidth_gbps,
+                factor
+            );
+            println!("              from {samples} measurements on this hardware)");
+        }
+        (None, None) => {
+            println!(
+                "  decode      {:.1} tok/s  ({} at {} GB/s, {:.0}% efficiency)",
+                rec.speed.decode_tps_x10 as f32 / 10.0,
+                rec.speed.method.name(),
+                rec.speed.bandwidth_gbps,
+                rec.speed.efficiency * 100.0
+            );
+        }
+    }
     match (rec.speed.prefill_tps_x10, rec.speed.ttft_ms) {
         (Some(p), Some(t)) => println!(
             "  prefill     {:.0} tok/s, {} ms to first token at {} context",
@@ -441,7 +498,7 @@ fn print_json<'a>(recs: impl Iterator<Item = &'a Recommendation<'a>>) {
             "  {{\"name\":\"{}\",\"params_m\":{},\"quant\":\"{}\",\"verdict\":\"{}\",\
              \"run_mode\":\"{}\",\"memory_mb\":{},\"pool_mb\":{},\"utilization_pct\":{:.1},\
              \"decode_tps\":{:.1},\"estimate_method\":\"{}\",\"bandwidth_gbps\":{},\
-             \"usable_context\":{},\"native_context\":{},\"kv_source\":\"{}\",\
+             \"usable_context\":{},\"native_context\":{},\"kv_source\":\"{}\",\"measured\":{},\
              \"prefill_tps\":{},\"ttft_ms\":{},\
              \"scores\":{{\"quality\":{},\"speed\":{},\"fit\":{},\"context\":{},\"composite\":{}}}}}",
             escape(rec.model.name()),
@@ -461,6 +518,7 @@ fn print_json<'a>(recs: impl Iterator<Item = &'a Recommendation<'a>>) {
                 openchoice_core::KvSource::Metadata => "metadata",
                 openchoice_core::KvSource::Estimated => "estimated",
             },
+            rec.speed.method.is_measured(),
             // null, not 0: "not estimated" is not "instant".
             rec.speed
                 .prefill_tps_x10

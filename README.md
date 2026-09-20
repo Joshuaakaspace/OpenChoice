@@ -9,18 +9,24 @@ nothing, so the same arithmetic runs in a desktop CLI and on a $3
 microcontroller holding the catalog in flash.
 
 ```
-openchoice> gpu rtx 4090
-rtx 4090: 1008 GB/s, 165.4 TFLOPS fp16
+openchoice> gpu apple m2 pro
+apple m2 pro: 200 GB/s, 13.5 TFLOPS fp16
 openchoice> vram 24576
-openchoice> ram 65536
+openchoice> ram 32768
 openchoice> go
-MODEL                          QUANT  TOK/S      FIT
-openai/gpt-oss-20b              Q8_0   68.2     Good
-microsoft/phi-4                 Q8_0   32.1     Good
-openai/gpt-oss-safeguard-20     Q8_0   67.1     Good
-moonshotai/Moonlight-16B-A3     Q8_0   31.0     Good
-Qwen/Qwen1.5-MoE-A2.7B          Q8_0   34.6     Good
+MODEL                        QUANT   TOK/S      FIT
+openai/gpt-oss-20b            Q8_0   22.3^    Good
+openai/gpt-oss-safeguard-     Q8_0   21.1+    Good
+OpenGVLab/InternVL3_5-GPT     Q8_0   21.3+    Good
+Qwen/Qwen3.6-35B-A3B-FP8      Q6_K   36.0^Marginal
+deepseek-ai/DeepSeek-R1-D     Q8_0   11.4^    Good
+* measured here  ^ rescaled  + calibrated
 ```
+
+Those marks matter. `^` means somebody actually ran that model on an M2 Pro and
+the figure was rescaled to the quantization shown; `+` means the formula was
+corrected using other measurements from that same machine. Nothing here is
+presented as an observation unless it is one.
 
 That is the on-device console, and it needs no network, host, or cloud. The
 transcript above was produced by `cargo run -p openchoice-embedded --example
@@ -44,10 +50,17 @@ catalog is a table.** Neither needs an operating system.
 
 | | llmfit | OpenChoice |
 |---|---|---|
-| Catalog for 15k models | 13.4 MB JSON, parsed at startup | 252 KB packed, read in place |
-| Engine dependencies | ~40 crates | zero |
-| Heap required | yes | none |
-| Runs on a microcontroller | no | yes — 57 KB code, 440 B `.bss` |
+| Catalog storage | ~890 bytes/model (JSON) | **~67 bytes/model** (packed) |
+| Startup | parses 13.4 MB of JSON | reads bytes in place, no parsing |
+| Engine dependencies | ~40 crates | **zero** |
+| Heap required | yes | **none** |
+| Runs on a microcontroller | no | **yes** — 60 KB code, 440 B `.bss` |
+| Real benchmark data | yes | **yes** — 358 measurements, 5.7 KB |
+
+The shipped 258 KB catalog holds 3,923 models — everything left after dropping
+sub-1M-parameter uploads, models with under 1,000 downloads, and non-text
+pipelines. Packing all 15,049 source entries would come to roughly 1 MB. The
+honest headline is the per-model figure, about 14x smaller than the JSON.
 
 ---
 
@@ -58,13 +71,17 @@ with the 1,500-model catalog:
 
 | Section | Bytes | What it is |
 |---|---:|---|
-| `.text` | 58,706 | the entire engine, console, and serial plumbing |
-| `.rodata` | 113,392 | packed catalog + GPU bandwidth table |
-| `.data` | 1,420 | |
+| `.text` | 60,298 | the entire engine, console, and serial plumbing |
+| `.rodata` | 118,688 | packed catalog, 309 measurements, GPU bandwidth table |
+| `.data` | 1,476 | |
 | `.bss` | **440** | static RAM — the engine allocates nothing |
 
-~175 KB of flash total. It fits on every ESP32 variant with room to spare, and
+~180 KB of flash total. It fits on every ESP32 variant with room to spare, and
 the full 3,923-model catalog would still leave a 4 MB part 90% empty.
+
+Carrying real benchmark data costs 1.6 KB of code and 5 KB of flash, and
+`.bss` does not move at all: the measurements are read in place from flash by
+binary search, like everything else.
 
 ---
 
@@ -79,7 +96,16 @@ cargo build --release
 You need a catalog. Build one from any llmfit-schema `hf_models.json`:
 
 ```sh
-cargo run --release -p openchoice-catalog -- build -i hf_models.json -o catalog/openchoice.ocb
+cargo run --release -p openchoice-catalog -- build \
+  -i hf_models.json -o catalog/openchoice.ocb
+```
+
+To fold in real benchmark measurements, point it at a directory of community
+submissions as well:
+
+```sh
+cargo run --release -p openchoice-catalog -- build \
+  -i hf_models.json --community path/to/community -o catalog/openchoice.ocb
 ```
 
 ---
@@ -183,14 +209,39 @@ prompt token, so bandwidth says nothing about it. When fp16 throughput for the
 hardware is unknown, prefill and TTFT report `null`, never `0.0`. Those mean
 different things and conflating them is how a spec sheet becomes a lie.
 
-Every estimate carries its method (`roofline` or `backend-constant`) and the
-bandwidth figure used, so any number can be reproduced by hand.
-
 Accuracy, stated plainly: the roofline runs optimistic on small models, where
 sampling and kernel-launch overhead are a larger share of the budget. The
 [test suite](openchoice-core/tests/engine.rs) pins estimates against published
 llama.cpp measurements within a ±40% band rather than tuning the tolerance
-away. These are estimates, and the confidence label exists to say so.
+away.
+
+### Measurements beat formulas, and say which they are
+
+The catalog can carry real benchmark results, keyed to the machine they were
+run on. Every speed reports which of four things it is, and they are never
+blended:
+
+| Mark | Method | What it means |
+|---|---|---|
+| `*` | `measured` | Someone ran this model, at this quantization, on this hardware |
+| `^` | `measured-adjusted` | Measured here at a *different* quantization, rescaled by the change in weight bytes |
+| `+` | `calibrated` | The formula, scaled by how wrong it has been on this hardware for other models |
+| ` ` | `roofline` | The formula, with nothing measured behind it |
+| `~` | `backend-constant` | Not even bandwidth is known for this machine |
+
+The `^` distinction is not pedantry. Most submitted benchmarks are Q4_K_M
+pulls, and the default quantization walk lands on Q8_0 — nearly twice the
+bytes per token. Reporting the raw Q4 figure against a Q8 row put a 39 tok/s
+measurement next to a configuration the formula placed at 2 tok/s. Now it is
+rescaled and labelled, and the raw observation is still shown underneath.
+
+`+` is what makes a handful of submissions pay off across the whole catalog: if
+the roofline overshot by 40% on every model measured on some card, it is
+overshooting the rest of the catalog on that card by roughly 40% too.
+
+A measured time-to-first-token is reported as belonging to *that benchmark
+run*, never re-attributed to the context length on screen — the prompt length
+was not recorded, so claiming otherwise would be inventing data.
 
 ### Context you get, not context advertised
 
@@ -228,6 +279,27 @@ enforced, not aspirational — it is what lets the same code build for
 
 - [Catalog format](docs/catalog-format.md) — the `.ocb` layout, byte by byte
 - [ESP32 guide](docs/esp32.md) — flashing, variants, sizing the catalog
+
+## Where the measurements come from
+
+The shipped catalog folds in the community benchmark submissions collected by
+[llmfit](https://github.com/AlexsJones/llmfit) — 358 aggregated measurements
+across 42 machines, with 23 of those machines having enough samples to derive
+a correction factor. Matching a submitted model name (`qwen3:8b`,
+`Qwen3-8B-Q4_K_M.gguf`, an MLX repo path) to a catalog entry happens in the
+packer, where it can be counted and inspected:
+
+```
+358 measurements from 358 submissions — 493 of 810 results matched a catalog model
+42 machines seen, 23 with enough samples for a calibration factor
+```
+
+493 of 810 is not a rounding error, and it is worth saying why the rest miss.
+About 140 are one submitter's private Ollama serving configs
+(`gemma4-12b-coder-fable5-latest-enfixed-agent-gpu100`), which name no
+published model. The remainder are genuine gaps in the normalizer. Run the
+packer with `--show-unmatched` to see them; improving that list is a
+self-contained contribution.
 
 ## Credits
 

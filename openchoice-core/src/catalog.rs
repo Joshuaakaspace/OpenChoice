@@ -12,11 +12,16 @@
 
 use crate::quant::Quant;
 
-/// `"OCB1"` — OpenChoice Binary catalog, version 1.
+/// `"OCB1"` — OpenChoice Binary catalog.
 pub const MAGIC: [u8; 4] = *b"OCB1";
-pub const FORMAT_VERSION: u16 = 1;
-pub const HEADER_LEN: usize = 32;
+/// Version 2 adds the measurement and calibration sections.
+pub const FORMAT_VERSION: u16 = 2;
+pub const HEADER_LEN: usize = 48;
 pub const RECORD_LEN: usize = 32;
+/// Stride of one measurement record.
+pub const MEASUREMENT_LEN: usize = 16;
+/// Stride of one calibration record.
+pub const CALIBRATION_LEN: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CatalogError {
@@ -28,6 +33,93 @@ pub enum CatalogError {
     BadRecordSize(u16),
     /// A section offset or length runs past the end of the buffer.
     Truncated,
+}
+
+/// Stable identifier for a machine, used to attach real measurements to it.
+///
+/// This is the one piece of string handling that has to agree between the
+/// packer (which reads hardware names out of submitted benchmark files) and
+/// whatever is asking the question later. Keeping it to a single tiny function
+/// — lowercase, drop everything that is not alphanumeric, FNV-1a — means there
+/// is one definition to keep honest rather than a normalizer on each side that
+/// can quietly drift apart.
+///
+/// `"NVIDIA GeForce RTX 4090"` and `"nvidia geforce rtx-4090"` hash alike;
+/// `"RTX 4080"` does not.
+pub fn hw_key(name: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in name.as_bytes() {
+        if !b.is_ascii_alphanumeric() {
+            continue;
+        }
+        hash ^= b.to_ascii_lowercase() as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    // Zero is reserved for "no hardware identity known", so a name that
+    // genuinely hashes there is nudged off it.
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+/// Which runtime produced a measurement. Throughput differs enough between
+/// them that the number is not interpretable without it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Provider {
+    Unknown = 0,
+    LlamaCpp = 1,
+    Ollama = 2,
+    Mlx = 3,
+    Vllm = 4,
+}
+
+impl Provider {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Provider::Unknown => "unknown",
+            Provider::LlamaCpp => "llama.cpp",
+            Provider::Ollama => "ollama",
+            Provider::Mlx => "mlx",
+            Provider::Vllm => "vllm",
+        }
+    }
+
+    pub const fn from_u8(v: u8) -> Provider {
+        match v {
+            1 => Provider::LlamaCpp,
+            2 => Provider::Ollama,
+            3 => Provider::Mlx,
+            4 => Provider::Vllm,
+            _ => Provider::Unknown,
+        }
+    }
+}
+
+/// A real throughput measurement someone recorded on real hardware.
+///
+/// These are the ground truth the estimator is checked against, and where one
+/// exists it is reported instead of a formula rather than averaged with it.
+/// Mixing a measurement into an estimate produces a number that is neither.
+#[derive(Clone, Copy, Debug)]
+pub struct Measurement {
+    /// Decode throughput, tokens/second x10.
+    pub tps_x10: u16,
+    /// Time to first token, milliseconds. Zero means it was not recorded.
+    pub ttft_ms: u16,
+    /// The quantization that was actually run, if it could be determined.
+    pub quant: Option<Quant>,
+    /// How many submitted runs were aggregated into this figure.
+    pub runs: u8,
+    pub provider: Provider,
+}
+
+impl Measurement {
+    pub const fn tps(&self) -> f32 {
+        self.tps_x10 as f32 / 10.0
+    }
 }
 
 /// What a model is for. Drives the scoring weights.
@@ -99,6 +191,11 @@ pub mod flags {
 pub struct Catalog<'a> {
     records: &'a [u8],
     strings: &'a [u8],
+    /// Measurements, sorted by `(hw_key, model_index)` so a lookup is a binary
+    /// search rather than a scan. Empty when the catalog carries no benchmarks.
+    measurements: &'a [u8],
+    /// Per-hardware correction factors, sorted by `hw_key`.
+    calibrations: &'a [u8],
     count: u32,
 }
 
@@ -126,25 +223,97 @@ impl<'a> Catalog<'a> {
         let rec_off = u32le(data, 12) as usize;
         let str_off = u32le(data, 16) as usize;
         let str_len = u32le(data, 20) as usize;
+        let meas_off = u32le(data, 24) as usize;
+        let meas_count = u32le(data, 28) as usize;
+        let cal_off = u32le(data, 32) as usize;
+        let cal_count = u32le(data, 36) as usize;
 
-        let rec_len = (count as usize)
-            .checked_mul(RECORD_LEN)
-            .ok_or(CatalogError::Truncated)?;
-        let rec_end = rec_off
-            .checked_add(rec_len)
-            .ok_or(CatalogError::Truncated)?;
-        let str_end = str_off
-            .checked_add(str_len)
-            .ok_or(CatalogError::Truncated)?;
-        if rec_end > data.len() || str_end > data.len() {
-            return Err(CatalogError::Truncated);
-        }
+        let records = section(data, rec_off, count as usize, RECORD_LEN)?;
+        let strings = section(data, str_off, str_len, 1)?;
+        let measurements = section(data, meas_off, meas_count, MEASUREMENT_LEN)?;
+        let calibrations = section(data, cal_off, cal_count, CALIBRATION_LEN)?;
 
         Ok(Catalog {
-            records: &data[rec_off..rec_end],
-            strings: &data[str_off..str_end],
+            records,
+            strings,
+            measurements,
+            calibrations,
             count,
         })
+    }
+
+    /// How many real measurements this catalog carries.
+    pub const fn measurement_count(&self) -> usize {
+        self.measurements.len() / MEASUREMENT_LEN
+    }
+
+    /// How many machines have a calibration factor.
+    pub const fn calibration_count(&self) -> usize {
+        self.calibrations.len() / CALIBRATION_LEN
+    }
+
+    /// A measurement of this exact model on this exact machine, if one exists.
+    ///
+    /// Binary search over a section sorted by `(hw_key, model_index)`: about
+    /// ten comparisons against a thousand measurements, with no allocation and
+    /// no scan, which is what makes this affordable inside a ranking loop over
+    /// the whole catalog.
+    pub fn measurement(&self, hw_key: u32, model_index: u32) -> Option<Measurement> {
+        if hw_key == 0 || self.measurements.is_empty() {
+            return None;
+        }
+        let needle = ((hw_key as u64) << 32) | model_index as u64;
+        let (mut lo, mut hi) = (0usize, self.measurement_count());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let at = mid * MEASUREMENT_LEN;
+            let key = ((u32le(self.measurements, at) as u64) << 32)
+                | u32le(self.measurements, at + 4) as u64;
+            match key.cmp(&needle) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    return Some(Measurement {
+                        tps_x10: u16le(self.measurements, at + 8),
+                        ttft_ms: u16le(self.measurements, at + 10),
+                        quant: Quant::from_u8(self.measurements[at + 12]),
+                        runs: self.measurements[at + 13],
+                        provider: Provider::from_u8(self.measurements[at + 14]),
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// The correction factor derived for this machine, if anyone has ever
+    /// benchmarked anything on it.
+    ///
+    /// This is what makes a handful of submissions useful far beyond the
+    /// models they covered: if the formula ran 30% optimistic across every
+    /// model measured on some card, it is running about 30% optimistic on the
+    /// rest of the catalog too. Returned as a multiplier on the roofline
+    /// estimate, along with how many measurements it was derived from so a
+    /// caller can weigh it.
+    pub fn calibration(&self, hw_key: u32) -> Option<(f32, u8)> {
+        if hw_key == 0 || self.calibrations.is_empty() {
+            return None;
+        }
+        let (mut lo, mut hi) = (0usize, self.calibration_count());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let at = mid * CALIBRATION_LEN;
+            let key = u32le(self.calibrations, at);
+            match key.cmp(&hw_key) {
+                core::cmp::Ordering::Less => lo = mid + 1,
+                core::cmp::Ordering::Greater => hi = mid,
+                core::cmp::Ordering::Equal => {
+                    let factor = u16le(self.calibrations, at + 4) as f32 / 1000.0;
+                    return Some((factor, self.calibrations[at + 6]));
+                }
+            }
+        }
+        None
     }
 
     pub const fn len(&self) -> usize {
@@ -163,6 +332,7 @@ impl<'a> Catalog<'a> {
         Some(Model {
             raw: &self.records[at..at + RECORD_LEN],
             strings: self.strings,
+            index: index as u32,
         })
     }
 
@@ -219,9 +389,18 @@ impl ExactSizeIterator for ModelIter<'_> {}
 pub struct Model<'a> {
     raw: &'a [u8],
     strings: &'a [u8],
+    index: u32,
 }
 
 impl<'a> Model<'a> {
+    /// Position in the catalog. Measurements are keyed by this rather than by
+    /// a name hash, so matching a benchmark to a model happens once, in the
+    /// packer, where the fuzzy name matching can be inspected and corrected —
+    /// not on every device, every time, with no way to tell it went wrong.
+    pub const fn index(&self) -> u32 {
+        self.index
+    }
+
     pub fn name(&self) -> &'a str {
         let off = u32le(self.raw, 0) as usize;
         read_cstr(self.strings, off)
@@ -327,6 +506,24 @@ impl<'a> Model<'a> {
 }
 
 // --- decoding helpers -------------------------------------------------------
+
+/// Bind one section, refusing anything that would read past the buffer.
+///
+/// All the bounds checking happens here, once, at parse time. That is what
+/// lets every accessor below index without returning a `Result`, and it means
+/// a truncated or corrupt catalog is rejected at the door rather than causing
+/// a panic on a device with no way to report one.
+fn section(data: &[u8], offset: usize, count: usize, stride: usize) -> Result<&[u8], CatalogError> {
+    if count == 0 {
+        return Ok(&[]);
+    }
+    let len = count.checked_mul(stride).ok_or(CatalogError::Truncated)?;
+    let end = offset.checked_add(len).ok_or(CatalogError::Truncated)?;
+    if end > data.len() {
+        return Err(CatalogError::Truncated);
+    }
+    Ok(&data[offset..end])
+}
 
 #[inline]
 fn u16le(buf: &[u8], at: usize) -> u16 {

@@ -35,11 +35,24 @@ which is the genuinely hard-won part of that project:
 The GPU bandwidth and fp16 throughput figures in `openchoice-core` were
 compiled independently from vendor specifications.
 
+The shipped catalog also folds in the community benchmark submissions
+collected by the llmfit project (llmfit-core/data/community), which are
+contributions from that project's users, published under the same MIT
+license. Those measurements are aggregated and re-keyed by OpenChoice but the
+underlying numbers are theirs.
+
 What is new here
 ----------------
 
   * The `.ocb` packed catalog format and its zero-copy, allocation-free
-    reader, which is what makes the catalog fit in microcontroller flash.
+    reader, which is what makes the catalog fit in microcontroller flash —
+    including the measurement and calibration sections, which put real
+    benchmark data on a microcontroller for 5.7 KB.
+  * Rescaling a measurement taken at one quantization onto another rather
+    than reporting it against a configuration it does not describe, and
+    labelling the result as adjusted.
+  * Deriving a per-machine correction factor so a handful of submissions
+    improve estimates for every model in the catalog on that machine.
   * A `no_std`, dependency-free, allocation-free engine (`openchoice-core`)
     that builds for bare-metal RISC-V and Xtensa targets.
   * The device console (`openchoice-embedded`) and ESP32 firmware.

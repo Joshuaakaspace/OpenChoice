@@ -65,18 +65,86 @@ fn build(entries: &[Entry]) -> Vec<u8> {
         records.push(e.quality);
     }
 
+    build_with(entries, &[], &[])
+}
+
+/// One measurement, as the packer would emit it.
+#[derive(Clone, Copy)]
+struct Meas {
+    hw_key: u32,
+    model_index: u32,
+    tps_x10: u16,
+    ttft_ms: u16,
+    quant: Quant,
+    runs: u8,
+}
+
+fn build_with(entries: &[Entry], meas: &[Meas], cal: &[(u32, u16, u8)]) -> Vec<u8> {
+    let mut strings = Vec::new();
+    let mut records = Vec::new();
+    for e in entries {
+        let off = strings.len() as u32;
+        strings.extend_from_slice(e.name.as_bytes());
+        strings.push(0);
+
+        records.extend_from_slice(&off.to_le_bytes());
+        records.extend_from_slice(&e.params_m.to_le_bytes());
+        records.extend_from_slice(&e.active_m.to_le_bytes());
+        records.extend_from_slice(&e.ctx.to_le_bytes());
+        records.extend_from_slice(&0u16.to_le_bytes());
+        records.extend_from_slice(&e.layers.to_le_bytes());
+        records.extend_from_slice(&e.kv_heads.to_le_bytes());
+        records.extend_from_slice(&e.head_dim.to_le_bytes());
+        records.extend_from_slice(&32u16.to_le_bytes());
+        records.extend_from_slice(&e.flags.to_le_bytes());
+        records.push(0);
+        records.push(e.use_case as u8);
+        records.push(0);
+        records.push(e.quality);
+    }
+
+    let mut mbytes = Vec::new();
+    for m in meas {
+        mbytes.extend_from_slice(&m.hw_key.to_le_bytes());
+        mbytes.extend_from_slice(&m.model_index.to_le_bytes());
+        mbytes.extend_from_slice(&m.tps_x10.to_le_bytes());
+        mbytes.extend_from_slice(&m.ttft_ms.to_le_bytes());
+        mbytes.push(m.quant as u8);
+        mbytes.push(m.runs);
+        mbytes.push(1); // provider: llama.cpp
+        mbytes.push(0);
+    }
+    let mut cbytes = Vec::new();
+    for (hw, factor, samples) in cal {
+        cbytes.extend_from_slice(&hw.to_le_bytes());
+        cbytes.extend_from_slice(&factor.to_le_bytes());
+        cbytes.push(*samples);
+        cbytes.push(0);
+    }
+
+    let rec_off = HEADER_LEN as u32;
+    let str_off = rec_off + records.len() as u32;
+    let meas_off = str_off + strings.len() as u32;
+    let cal_off = meas_off + mbytes.len() as u32;
+
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&(RECORD_LEN as u16).to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(HEADER_LEN as u32).to_le_bytes());
-    out.extend_from_slice(&((HEADER_LEN + records.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&rec_off.to_le_bytes());
+    out.extend_from_slice(&str_off.to_le_bytes());
     out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    out.extend_from_slice(&meas_off.to_le_bytes());
+    out.extend_from_slice(&(meas.len() as u32).to_le_bytes());
+    out.extend_from_slice(&cal_off.to_le_bytes());
+    out.extend_from_slice(&(cal.len() as u32).to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&records);
     out.extend_from_slice(&strings);
+    out.extend_from_slice(&mbytes);
+    out.extend_from_slice(&cbytes);
     out
 }
 
@@ -90,6 +158,7 @@ fn gpu(vram_mb: u32, bandwidth: u16) -> Hardware {
         ram_bandwidth_gbps: 0,
         tflops_fp16_x10: 0,
         os_reserve_mb: 2048,
+        hw_key: 0,
     }
 }
 
@@ -147,7 +216,7 @@ fn the_verdict_follows_pool_utilisation_and_nothing_else() {
         ..Default::default()
     };
 
-    let roomy = evaluate_model(&model, &gpu(24 * 1024, 1008), &opts);
+    let roomy = evaluate_model(&catalog, &model, &gpu(24 * 1024, 1008), &opts);
     assert_eq!(roomy.fit.verdict, Verdict::Perfect);
     assert_eq!(roomy.fit.run_mode, RunMode::Gpu);
     assert_eq!(roomy.fit.quant, Quant::Q8_0);
@@ -155,7 +224,7 @@ fn the_verdict_follows_pool_utilisation_and_nothing_else() {
 
     // Same model, a pool it half fills: Good rather than Perfect, and still
     // wholly on the card.
-    let snug = evaluate_model(&model, &gpu(11 * 1024, 1008), &opts);
+    let snug = evaluate_model(&catalog, &model, &gpu(11 * 1024, 1008), &opts);
     assert_eq!(snug.fit.run_mode, RunMode::Gpu);
     assert_eq!(snug.fit.verdict, Verdict::Good);
     assert!((600..=850).contains(&snug.fit.utilization_pctx10));
@@ -175,7 +244,7 @@ fn a_full_card_spills_to_ram_before_it_degrades_quality() {
         ram_mb: 64 * 1024,
         ..gpu(6 * 1024, 1008)
     };
-    let rec = evaluate_model(&model, &small_card_big_box, &Opts::default());
+    let rec = evaluate_model(&catalog, &model, &small_card_big_box, &Opts::default());
 
     assert_eq!(rec.fit.run_mode, RunMode::CpuGpu);
     assert_eq!(
@@ -196,6 +265,7 @@ fn a_single_pool_steps_down_the_quantization_hierarchy() {
 
     // 8 GiB CPU-only: 6 GiB usable, against ~7.1 GiB of Q8_0 weights.
     let rec = evaluate_model(
+        &catalog,
         &model,
         &Hardware::cpu_only(8 * 1024, false),
         &Opts::default(),
@@ -221,7 +291,7 @@ fn a_cpu_fit_never_reaches_perfect() {
     let model = catalog.get(0).unwrap();
 
     let cpu = Hardware::cpu_only(64 * 1024, false);
-    let rec = evaluate_model(&model, &cpu, &Opts::default());
+    let rec = evaluate_model(&catalog, &model, &cpu, &Opts::default());
 
     assert_eq!(rec.fit.run_mode, RunMode::Cpu);
     assert_eq!(
@@ -236,6 +306,7 @@ fn nothing_fits_reports_too_tight_rather_than_an_error() {
     let bytes = build(&[entry("huge", 405_000, 8192)]);
     let catalog = Catalog::parse(&bytes).unwrap();
     let rec = evaluate_model(
+        &catalog,
         &catalog.get(0).unwrap(),
         &gpu(8 * 1024, 900),
         &Opts::default(),
@@ -254,7 +325,7 @@ fn f16_is_not_considered_unless_asked_for() {
     let model = catalog.get(0).unwrap();
     let roomy = gpu(48 * 1024, 1008);
 
-    let default = evaluate_model(&model, &roomy, &Opts::default());
+    let default = evaluate_model(&catalog, &model, &roomy, &Opts::default());
     assert_eq!(
         default.fit.quant,
         Quant::Q8_0,
@@ -262,6 +333,7 @@ fn f16_is_not_considered_unless_asked_for() {
     );
 
     let explicit = evaluate_model(
+        &catalog,
         &model,
         &roomy,
         &Opts {
@@ -282,8 +354,9 @@ fn a_smaller_kv_cache_can_rescue_a_long_context_model() {
     let model = catalog.get(0).unwrap();
     let hw = gpu(24 * 1024, 1008);
 
-    let f16 = evaluate_model(&model, &hw, &Opts::default());
+    let f16 = evaluate_model(&catalog, &model, &hw, &Opts::default());
     let q4 = evaluate_model(
+        &catalog,
         &model,
         &hw,
         &Opts {
@@ -323,6 +396,7 @@ fn kv_cache_uses_model_metadata_when_it_exists() {
     let bytes = build(&[entry("m", 8000, 8192)]);
     let catalog = Catalog::parse(&bytes).unwrap();
     let rec = evaluate_model(
+        &catalog,
         &catalog.get(0).unwrap(),
         &gpu(24 * 1024, 1008),
         &Opts::default(),
@@ -346,6 +420,7 @@ fn a_model_without_metadata_says_its_kv_figure_is_estimated() {
     let bytes = build(&[e]);
     let catalog = Catalog::parse(&bytes).unwrap();
     let rec = evaluate_model(
+        &catalog,
         &catalog.get(0).unwrap(),
         &gpu(24 * 1024, 1008),
         &Opts::default(),
@@ -399,6 +474,7 @@ fn decode_estimates_land_near_published_measurements() {
         let bytes = build(&[entry("m", params, 4096)]);
         let catalog = Catalog::parse(&bytes).unwrap();
         let rec = evaluate_model(
+            &catalog,
             &catalog.get(0).unwrap(),
             &gpu(vram, bw),
             &Opts {
@@ -421,7 +497,7 @@ fn prefill_is_not_estimated_without_fp16_throughput() {
     let catalog = Catalog::parse(&bytes).unwrap();
     let model = catalog.get(0).unwrap();
 
-    let unknown = evaluate_model(&model, &gpu(24 * 1024, 1008), &Opts::default());
+    let unknown = evaluate_model(&catalog, &model, &gpu(24 * 1024, 1008), &Opts::default());
     assert_eq!(
         unknown.speed.prefill_tps_x10, None,
         "an unknown prefill must be None, never 0.0 — those mean different things"
@@ -430,7 +506,7 @@ fn prefill_is_not_estimated_without_fp16_throughput() {
 
     let mut hw = gpu(24 * 1024, 1008);
     hw.tflops_fp16_x10 = 1654;
-    let known = evaluate_model(&model, &hw, &Opts::default());
+    let known = evaluate_model(&catalog, &model, &hw, &Opts::default());
     assert!(known.speed.prefill_tps_x10.is_some());
     assert!(known.speed.ttft_ms.is_some());
 }
@@ -440,6 +516,7 @@ fn an_unknown_memory_system_falls_back_and_says_so() {
     let bytes = build(&[entry("m", 7000, 4096)]);
     let catalog = Catalog::parse(&bytes).unwrap();
     let rec = evaluate_model(
+        &catalog,
         &catalog.get(0).unwrap(),
         &gpu(24 * 1024, 0),
         &Opts::default(),
@@ -463,7 +540,7 @@ fn a_sparse_model_is_charged_for_its_active_parameters_when_offloading() {
     let model = catalog.get(0).unwrap();
 
     // Too big for the card whole, but the active slice fits.
-    let rec = evaluate_model(&model, &gpu(24 * 1024, 1008), &Opts::default());
+    let rec = evaluate_model(&catalog, &model, &gpu(24 * 1024, 1008), &Opts::default());
     assert_eq!(rec.fit.run_mode, RunMode::MoeOffload);
     assert!(rec.fit.memory.offloaded_mb > 0);
     assert!(
@@ -534,8 +611,8 @@ fn bigger_models_score_higher_on_capability_when_both_fit() {
     let catalog = Catalog::parse(&bytes).unwrap();
     let hw = gpu(48 * 1024, 1008);
 
-    let small = evaluate_model(&catalog.get(0).unwrap(), &hw, &Opts::default());
-    let large = evaluate_model(&catalog.get(1).unwrap(), &hw, &Opts::default());
+    let small = evaluate_model(&catalog, &catalog.get(0).unwrap(), &hw, &Opts::default());
+    let large = evaluate_model(&catalog, &catalog.get(1).unwrap(), &hw, &Opts::default());
 
     assert!(
         large.scores.quality > small.scores.quality,
@@ -589,4 +666,244 @@ fn gpu_lookup_prefers_the_most_specific_match() {
     );
 
     assert!(openchoice_core::lookup_gpu("Some Unreleased Card").is_none());
+}
+
+// --- measurements -----------------------------------------------------------
+
+const TEST_HW: u32 = 0xABCD_1234;
+
+fn measured_gpu(vram_mb: u32, bandwidth: u16) -> Hardware {
+    Hardware {
+        hw_key: TEST_HW,
+        ..gpu(vram_mb, bandwidth)
+    }
+}
+
+#[test]
+fn a_measurement_at_the_same_quantization_replaces_the_formula_outright() {
+    let bytes = build_with(
+        &[entry("m", 7000, 4096)],
+        &[Meas {
+            hw_key: TEST_HW,
+            model_index: 0,
+            tps_x10: 1234,
+            ttft_ms: 250,
+            quant: Quant::Q8_0,
+            runs: 3,
+        }],
+        &[],
+    );
+    let catalog = Catalog::parse(&bytes).unwrap();
+    let model = catalog.get(0).unwrap();
+    let hw = measured_gpu(24 * 1024, 1008);
+
+    let rec = evaluate_model(&catalog, &model, &hw, &Opts::default());
+    assert_eq!(rec.fit.quant, Quant::Q8_0);
+    assert_eq!(rec.speed.method, openchoice_core::EstimateMethod::Measured);
+    assert_eq!(
+        rec.speed.decode_tps_x10, 1234,
+        "a measurement is reported as-is, never averaged with the estimate"
+    );
+    assert_eq!(rec.speed.measurement.unwrap().runs, 3);
+}
+
+/// The bug this pins: a Q4 benchmark was being printed against a Q8 row, so a
+/// 39 tok/s measurement sat next to a configuration the formula put at 2 tok/s.
+#[test]
+fn a_measurement_at_another_quantization_is_rescaled_and_relabelled() {
+    let bytes = build_with(
+        &[entry("m", 7000, 4096)],
+        &[Meas {
+            hw_key: TEST_HW,
+            model_index: 0,
+            tps_x10: 1000, // 100 tok/s at Q4_K_M
+            ttft_ms: 0,
+            quant: Quant::Q4KM,
+            runs: 2,
+        }],
+        &[],
+    );
+    let catalog = Catalog::parse(&bytes).unwrap();
+    let hw = measured_gpu(24 * 1024, 1008);
+    let rec = evaluate_model(&catalog, &catalog.get(0).unwrap(), &hw, &Opts::default());
+
+    assert_eq!(rec.fit.quant, Quant::Q8_0);
+    assert_eq!(
+        rec.speed.method,
+        openchoice_core::EstimateMethod::MeasuredAdjusted,
+        "it must not claim to be a measurement of the configuration shown"
+    );
+    // Q4_K_M is 4.83 bpw against 8.5 for Q8_0, so the same silicon moves about
+    // 1.76x the bytes per token: 100 tok/s becomes ~57.
+    let tps = rec.speed.decode_tps_x10 as f32 / 10.0;
+    assert!(
+        (55.0..=59.0).contains(&tps),
+        "expected ~56.8 tok/s after rescaling, got {tps}"
+    );
+    // The raw observation is still available, unmodified.
+    assert_eq!(rec.speed.measurement.unwrap().tps_x10, 1000);
+}
+
+#[test]
+fn a_measured_ttft_is_not_attributed_to_a_different_context() {
+    let bytes = build_with(
+        &[entry("m", 7000, 131_072)],
+        &[Meas {
+            hw_key: TEST_HW,
+            model_index: 0,
+            tps_x10: 500,
+            ttft_ms: 300,
+            quant: Quant::Q8_0,
+            runs: 1,
+        }],
+        &[],
+    );
+    let catalog = Catalog::parse(&bytes).unwrap();
+    let mut hw = measured_gpu(48 * 1024, 1008);
+    hw.tflops_fp16_x10 = 1654;
+    let rec = evaluate_model(&catalog, &catalog.get(0).unwrap(), &hw, &Opts::default());
+
+    // 300 ms belonged to whatever prompt the benchmark used; this row shows a
+    // 128k context. Reporting the former against the latter would assert
+    // something nobody measured, so the estimate stands and the raw figure
+    // stays separate.
+    assert_ne!(rec.speed.ttft_ms, Some(300));
+    assert_eq!(rec.speed.measurement.unwrap().ttft_ms, 300);
+}
+
+#[test]
+fn calibration_scales_the_formula_for_models_nobody_benchmarked() {
+    let bytes = build_with(
+        &[entry("unbenchmarked", 7000, 4096)],
+        &[],
+        &[(TEST_HW, 600, 5)], // the formula ran 40% optimistic here
+    );
+    let catalog = Catalog::parse(&bytes).unwrap();
+    let hw = measured_gpu(24 * 1024, 1008);
+
+    let plain = evaluate_model(
+        &catalog,
+        &catalog.get(0).unwrap(),
+        &gpu(24 * 1024, 1008),
+        &Opts::default(),
+    );
+    let calibrated = evaluate_model(&catalog, &catalog.get(0).unwrap(), &hw, &Opts::default());
+
+    assert_eq!(
+        plain.speed.method,
+        openchoice_core::EstimateMethod::Roofline
+    );
+    assert_eq!(
+        calibrated.speed.method,
+        openchoice_core::EstimateMethod::Calibrated
+    );
+    assert_eq!(calibrated.speed.calibration, Some((0.6, 5)));
+    let ratio = calibrated.speed.decode_tps_x10 as f32 / plain.speed.decode_tps_x10 as f32;
+    assert!(
+        (0.58..=0.62).contains(&ratio),
+        "expected a 0.6x scale, got {ratio}"
+    );
+}
+
+#[test]
+fn an_unidentified_machine_finds_nothing_rather_than_the_wrong_thing() {
+    let bytes = build_with(
+        &[entry("m", 7000, 4096)],
+        &[Meas {
+            hw_key: TEST_HW,
+            model_index: 0,
+            tps_x10: 9999,
+            ttft_ms: 0,
+            quant: Quant::Q8_0,
+            runs: 1,
+        }],
+        &[(TEST_HW, 500, 4)],
+    );
+    let catalog = Catalog::parse(&bytes).unwrap();
+
+    // hw_key 0 means the machine was never identified.
+    let rec = evaluate_model(
+        &catalog,
+        &catalog.get(0).unwrap(),
+        &gpu(24 * 1024, 1008),
+        &Opts::default(),
+    );
+    assert_eq!(rec.speed.method, openchoice_core::EstimateMethod::Roofline);
+    assert!(rec.speed.measurement.is_none());
+
+    // A different machine must not inherit these numbers either.
+    let other = Hardware {
+        hw_key: 0xFEED_BEEF,
+        ..gpu(24 * 1024, 1008)
+    };
+    let rec = evaluate_model(&catalog, &catalog.get(0).unwrap(), &other, &Opts::default());
+    assert!(rec.speed.measurement.is_none());
+}
+
+#[test]
+fn measurement_lookup_finds_every_entry_it_packed() {
+    // Enough entries that the binary search has to actually work.
+    let entries: Vec<Entry> = (0..64).map(|_| entry("m", 7000, 4096)).collect();
+    let meas: Vec<Meas> = (0..64)
+        .map(|i| Meas {
+            hw_key: TEST_HW,
+            model_index: i,
+            tps_x10: 100 + i as u16,
+            ttft_ms: 0,
+            quant: Quant::Q8_0,
+            runs: 1,
+        })
+        .collect();
+    let bytes = build_with(&entries, &meas, &[]);
+    let catalog = Catalog::parse(&bytes).unwrap();
+
+    for i in 0..64u32 {
+        let found = catalog
+            .measurement(TEST_HW, i)
+            .unwrap_or_else(|| panic!("measurement {i} was packed but not found"));
+        assert_eq!(found.tps_x10, 100 + i as u16);
+    }
+    assert!(catalog.measurement(TEST_HW, 64).is_none());
+}
+
+#[test]
+fn hardware_keys_ignore_punctuation_and_case_but_not_identity() {
+    use openchoice_core::hw_key;
+    assert_eq!(
+        hw_key("NVIDIA GeForce RTX 4090"),
+        hw_key("nvidia geforce rtx-4090")
+    );
+    assert_ne!(hw_key("RTX 4090"), hw_key("RTX 4080"));
+    assert_ne!(hw_key("Apple M2 Pro"), hw_key("Apple M2 Max"));
+    assert_ne!(hw_key(""), 0, "zero is reserved for unidentified hardware");
+}
+
+#[test]
+fn unified_memory_past_the_wired_limit_is_not_called_cpu() {
+    let bytes = build(&[entry("big", 20_000, 8192)]);
+    let catalog = Catalog::parse(&bytes).unwrap();
+    let apple = Hardware {
+        ram_mb: 32 * 1024,
+        vram_mb: 16 * 1024,
+        unified: true,
+        backend: Backend::Metal,
+        gpu_bandwidth_gbps: 200,
+        ram_bandwidth_gbps: 0,
+        tflops_fp16_x10: 0,
+        os_reserve_mb: 2048,
+        hw_key: 0,
+    };
+    let rec = evaluate_model(&catalog, &catalog.get(0).unwrap(), &apple, &Opts::default());
+
+    assert_eq!(rec.fit.run_mode, RunMode::UnifiedSpill);
+    assert!(
+        rec.fit.verdict <= Verdict::Good,
+        "a spilled fit cannot be Perfect"
+    );
+    // And it is estimated at the real bandwidth of the part, not a DDR
+    // default: there is only one memory system on these machines.
+    assert!(
+        rec.speed.decode_tps_x10 > 0,
+        "unified spill still runs against the accelerator memory"
+    );
 }

@@ -88,6 +88,13 @@ pub fn detect() -> Detected {
         ram_bandwidth_gbps: 0,
         tflops_fp16_x10: tflops,
         os_reserve_mb: if ram_mb > 16_384 { 4096 } else { 2048 },
+        // Identity for the measurement lookup. Community submissions record
+        // the accelerator name, so that is what has to be hashed here; a
+        // CPU-only box has no such identity and simply finds nothing.
+        hw_key: gpu_name
+            .as_deref()
+            .map(openchoice_core::hw_key)
+            .unwrap_or(0),
     };
 
     Detected {

@@ -15,27 +15,50 @@
 //! `None` — deliberately different from `0.0`, which would read as
 //! "immeasurably slow" rather than "not estimated".
 
-use crate::catalog::Model;
+use crate::catalog::{Catalog, Measurement, Model};
 use crate::fit::{Fit, RunMode};
 use crate::hardware::{BandwidthSource, Hardware};
 
 /// How a throughput number was arrived at. Travels with every estimate so it
 /// can be weighed rather than trusted.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Ordered best to worst. The distinction that matters most is the first one:
+/// a measurement and a formula are both reported in tokens per second, and
+/// presenting them identically is how a guess acquires unearned authority.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum EstimateMethod {
-    /// Bytes-moved over real memory bandwidth. The good case.
+    /// Somebody ran this model, at this quantization, on this hardware and
+    /// recorded the result. Not an estimate at all.
+    Measured,
+    /// Measured on this hardware, but at a different quantization than the one
+    /// being reported, and rescaled by the change in weight bytes. Decode is
+    /// bandwidth-bound, so that rescaling is sound — but it is no longer a
+    /// number anybody observed, and it does not claim to be.
+    MeasuredAdjusted,
+    /// A formula, scaled by a factor derived from real measurements taken on
+    /// this same hardware with other models.
+    Calibrated,
+    /// Bytes-moved over real memory bandwidth, with nothing measured behind it.
     Roofline,
-    /// No bandwidth known for this hardware; a per-backend constant divided by
-    /// parameter count. Order-of-magnitude only.
+    /// No bandwidth known for this hardware either; a per-backend constant
+    /// divided by parameter count. Order-of-magnitude only.
     BackendConstant,
 }
 
 impl EstimateMethod {
     pub const fn name(self) -> &'static str {
         match self {
+            EstimateMethod::Measured => "measured",
+            EstimateMethod::MeasuredAdjusted => "measured-adjusted",
+            EstimateMethod::Calibrated => "calibrated",
             EstimateMethod::Roofline => "roofline",
             EstimateMethod::BackendConstant => "backend-constant",
         }
+    }
+
+    /// Whether this number came from hardware rather than arithmetic.
+    pub const fn is_measured(self) -> bool {
+        matches!(self, EstimateMethod::Measured)
     }
 }
 
@@ -56,6 +79,11 @@ pub struct Speed {
     pub bandwidth_gbps: u16,
     pub bandwidth_source: BandwidthSource,
     pub efficiency: f32,
+    /// The measurement behind this number, when there is one.
+    pub measurement: Option<Measurement>,
+    /// The correction factor applied, and how many measurements it came from.
+    /// Only set for `Calibrated`.
+    pub calibration: Option<(f32, u8)>,
 }
 
 impl Speed {
@@ -65,8 +93,78 @@ impl Speed {
     }
 }
 
-/// Estimate decode and prefill throughput for a model on a machine, given the
-/// fit that was already computed for it.
+/// Decode and prefill throughput for a model on a machine.
+///
+/// Consults the catalog's measurements first. The order is deliberate and the
+/// steps are never blended:
+///
+/// 1. **Measured** — somebody ran exactly this on exactly this hardware.
+/// 2. **Calibrated** — the formula, scaled by how wrong it has been on this
+///    hardware for other models.
+/// 3. **Roofline** — the formula, unadjusted.
+/// 4. **Backend constant** — a last resort when even bandwidth is unknown.
+pub fn estimate_with_catalog(
+    catalog: &Catalog<'_>,
+    model: &Model,
+    hw: &Hardware,
+    fit: &Fit,
+    efficiency: f32,
+) -> Speed {
+    let mut speed = estimate(model, hw, fit, efficiency);
+
+    if let Some(m) = catalog.measurement(hw.hw_key, model.index()) {
+        speed.measurement = Some(m);
+        match m.quant {
+            // Same quantization: a real number, reported as-is. It is not
+            // averaged with the formula, because the average of a measurement
+            // and a guess is neither of them.
+            Some(q) if q == fit.quant => {
+                speed.decode_tps_x10 = m.tps_x10 as u32;
+                speed.method = EstimateMethod::Measured;
+            }
+            // Different quantization. The run is still informative — it is the
+            // same weights on the same silicon — but it moved a different
+            // number of bytes per token. Rescale by that ratio rather than
+            // reporting a Q4 result against a Q8 row, which would have shown
+            // a 39 tok/s measurement next to a 2 tok/s configuration.
+            Some(q) => {
+                let ratio = q.bits_per_weight() / fit.quant.bits_per_weight();
+                speed.decode_tps_x10 = (m.tps_x10 as f32 * ratio) as u32;
+                speed.method = EstimateMethod::MeasuredAdjusted;
+            }
+            None => {}
+        }
+        // The measured TTFT belongs to whatever prompt the benchmark used, and
+        // that length was not recorded. Attaching it to this row's context
+        // would be asserting something nobody measured, so `ttft_ms` keeps the
+        // formula's value and the raw figure stays on `measurement` for a
+        // caller that wants to show it as what it is.
+        if speed.method != EstimateMethod::Roofline {
+            return speed;
+        }
+    }
+
+    // No measurement for this pairing, but if the formula has been checked
+    // against this hardware before, apply what that showed. A card the
+    // roofline overshoots by 30% on every model measured is overshooting the
+    // rest of the catalog by roughly 30% too.
+    if speed.method == EstimateMethod::Roofline {
+        if let Some((factor, samples)) = catalog.calibration(hw.hw_key) {
+            speed.decode_tps_x10 = (speed.decode_tps_x10 as f32 * factor) as u32;
+            speed.method = EstimateMethod::Calibrated;
+            speed.calibration = Some((factor, samples));
+            if let Some(ttft) = speed.ttft_ms {
+                speed.ttft_ms = Some((ttft as f32 / factor.max(0.05)) as u32);
+            }
+        }
+    }
+
+    speed
+}
+
+/// The formula alone, with no measurement lookup. Exposed for callers that
+/// deliberately want the unadjusted estimate — comparing it against a
+/// measurement, for instance.
 pub fn estimate(model: &Model, hw: &Hardware, fit: &Fit, efficiency: f32) -> Speed {
     let (gpu_bw, bw_source) = hw.resolve_gpu_bandwidth();
     let ram_bw = hw.effective_ram_bandwidth();
@@ -78,7 +176,10 @@ pub fn estimate(model: &Model, hw: &Hardware, fit: &Fit, efficiency: f32) -> Spe
 
     // Which memory that traffic comes from.
     let effective_bw = match fit.run_mode {
-        RunMode::Cpu => ram_bw,
+        // Both read system memory; on a unified machine that is the same fast
+        // pool the GPU uses, which `effective_ram_bandwidth` already accounts
+        // for, so the two cases share an arm rather than a magic constant.
+        RunMode::Cpu | RunMode::UnifiedSpill => ram_bw,
         RunMode::Gpu => {
             if gpu_bw > 0.0 {
                 gpu_bw
@@ -154,5 +255,7 @@ pub fn estimate(model: &Model, hw: &Hardware, fit: &Fit, efficiency: f32) -> Spe
             BandwidthSource::BackendConstant
         },
         efficiency,
+        measurement: None,
+        calibration: None,
     }
 }

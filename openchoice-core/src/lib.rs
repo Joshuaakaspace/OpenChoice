@@ -24,10 +24,11 @@
 //!     ram_bandwidth_gbps: 0,
 //!     tflops_fp16_x10: 1654,
 //!     os_reserve_mb: 2048,
+//!     hw_key: openchoice_core::catalog::hw_key("NVIDIA GeForce RTX 4090"),
 //! };
 //!
 //! if let Some(model) = catalog.find("mistral-7b") {
-//!     let r = evaluate_model(&model, &hw, &Opts::default());
+//!     let r = evaluate_model(&catalog, &model, &hw, &Opts::default());
 //!     // r.fit.verdict, r.speed.decode_tps(), r.scores.composite
 //! }
 //! ```
@@ -42,7 +43,7 @@ pub mod quant;
 pub mod score;
 pub mod speed;
 
-pub use catalog::{Catalog, CatalogError, Model, UseCase};
+pub use catalog::{hw_key, Catalog, CatalogError, Measurement, Model, Provider, UseCase};
 pub use fit::{Fit, KvSource, MemoryBreakdown, Opts, RunMode, Verdict};
 pub use hardware::{Backend, BandwidthSource, Hardware};
 pub use quant::{KvQuant, Quant};
@@ -74,9 +75,14 @@ impl core::fmt::Debug for Model<'_> {
 /// Score one model. The three stages run in order because each depends on the
 /// last: the quantization and run mode chosen by the fit determine how many
 /// bytes move per token, which determines the speed, which feeds the score.
-pub fn evaluate_model<'a>(model: &Model<'a>, hw: &Hardware, opts: &Opts) -> Recommendation<'a> {
+pub fn evaluate_model<'a>(
+    catalog: &Catalog<'a>,
+    model: &Model<'a>,
+    hw: &Hardware,
+    opts: &Opts,
+) -> Recommendation<'a> {
     let fit = fit::evaluate(model, hw, opts);
-    let speed = speed::estimate(model, hw, &fit, opts.efficiency);
+    let speed = speed::estimate_with_catalog(catalog, model, hw, &fit, opts.efficiency);
     // The caller's use case wins when given: asking "what should I use for
     // coding" must reweight the whole catalog, not just re-sort the models
     // already labelled as coding models.
@@ -260,7 +266,7 @@ pub fn recommend<'a, const N: usize>(
 ) -> TopN<'a, N> {
     let mut top = TopN::<N>::new();
     for model in catalog.iter() {
-        let rec = evaluate_model(&model, hw, opts);
+        let rec = evaluate_model(catalog, &model, hw, opts);
         if filter.admits(&rec) {
             top.push(rec);
         }

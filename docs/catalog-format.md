@@ -5,24 +5,34 @@ table. There is no compression, no index, and no framing — the point is that a
 reader can `mmap` it or point at flash and start answering questions without
 parsing anything.
 
-15,049 source models pack to **252 KB** after filtering, against 13.4 MB of
-equivalent JSON. That ratio is what makes the whole project possible.
+After filtering, 3,923 models pack to **258 KB** — about 67 bytes each against
+roughly 890 bytes each in the source JSON. That ratio is what makes the whole
+project possible.
 
 All integers are **little-endian**. All offsets are from the start of the file.
 
-## Header — 32 bytes
+## Header — 48 bytes
 
 | Offset | Size | Field | Notes |
 |---:|---:|---|---|
 | 0 | 4 | magic | `"OCB1"` |
-| 4 | 2 | version | currently `1`; a reader rejects anything else |
+| 4 | 2 | version | currently `2`; a reader rejects anything else |
 | 6 | 2 | record_size | currently `32`; rejected if it differs |
 | 8 | 4 | record_count | |
 | 12 | 4 | records_offset | |
 | 16 | 4 | strings_offset | |
 | 20 | 4 | strings_length | |
-| 24 | 4 | flags | reserved, zero |
-| 28 | 4 | checksum | reserved, zero |
+| 24 | 4 | measurements_offset | |
+| 28 | 4 | measurement_count | zero when the catalog carries no benchmarks |
+| 32 | 4 | calibrations_offset | |
+| 36 | 4 | calibration_count | |
+| 40 | 4 | flags | reserved, zero |
+| 44 | 4 | checksum | reserved, zero |
+
+Version 2 added the two measurement sections. Version 1 files are refused
+outright rather than read with the new fields defaulted — a reader that
+guesses at a layout it does not know is how a device ends up confidently
+wrong.
 
 `record_size` is in the header and checked rather than assumed. A future
 version that widens the record can be detected and refused cleanly instead of
@@ -75,11 +85,59 @@ the table yields an empty string rather than a panic: a corrupt catalog should
 degrade to useless output, not take down a device that cannot report a
 backtrace.
 
+## Measurement — 16 bytes
+
+Real benchmark results, sorted by `(hw_key, model_index)` so a lookup is a
+binary search with no allocation.
+
+| Offset | Size | Field | Notes |
+|---:|---:|---|---|
+| 0 | 4 | hw_key | FNV-1a of the machine name, alphanumerics only, lowercased |
+| 4 | 4 | model_index | position in the record section |
+| 8 | 2 | tps_x10 | measured decode throughput x10 |
+| 10 | 2 | ttft_ms | time to first token in that run; 0 if not recorded |
+| 12 | 1 | quant | `Quant` discriminant the run actually used |
+| 13 | 1 | runs | how many submitted runs were aggregated |
+| 14 | 1 | provider | 1 llama.cpp, 2 ollama, 3 mlx, 4 vllm |
+| 15 | 1 | flags | reserved, zero |
+
+Measurements are keyed by **catalog index, not by a name hash**. Reconciling
+`qwen3:8b` with `Qwen/Qwen3-8B` is fuzzy work; doing it once in the packer
+means it can be counted, printed, and corrected. Doing it on the device would
+mean every reader re-deriving the same guess with no way to audit it.
+
+The `quant` field is what lets a Q4 benchmark inform a Q8 row honestly:
+decode is bandwidth-bound, so the engine rescales by the ratio of bits per
+weight and downgrades the label from `measured` to `measured-adjusted`.
+
+## Calibration — 8 bytes
+
+| Offset | Size | Field | Notes |
+|---:|---:|---|---|
+| 0 | 4 | hw_key | same hash as above |
+| 4 | 2 | factor_x1000 | multiplier on the roofline estimate |
+| 6 | 1 | samples | measurements the factor was derived from |
+| 7 | 1 | flags | reserved, zero |
+
+Derived at pack time as the median of `measured / predicted` across every
+measurement on that machine, using this engine to produce the prediction — so
+a factor always describes the formula that is actually shipping. Ratios
+outside 0.05–5.0 are discarded as misidentified pairings rather than allowed
+to poison the median, and a machine with fewer than two samples gets no factor
+at all: one measurement is an anecdote.
+
 ## Building one
 
 ```sh
 # everything worth keeping
 openchoice-catalog build -i hf_models.json -o catalog/openchoice.ocb
+
+# with real measurements folded in
+openchoice-catalog build -i hf_models.json --community ./community -o out.ocb
+
+# see which benchmark names matched no catalog model
+openchoice-catalog build -i hf_models.json --community ./community \
+  -o out.ocb --show-unmatched
 
 # a small one for a tight flash budget, most-downloaded first
 openchoice-catalog build -i hf_models.json -o tiny.ocb --top 512
@@ -101,9 +159,11 @@ place that can catch it before a device tries to boot on it.
 
 | Models | File size | Notes |
 |---:|---:|---|
-| 512 | ~33 KB | fits anywhere, including an ESP8266-class part |
-| 1,500 | 93 KB | the firmware default |
-| 3,923 | 252 KB | everything that survives default filtering |
+| 512 | ~35 KB | fits anywhere, including an ESP8266-class part |
+| 1,500 | 98 KB | the firmware default, with 309 measurements |
+| 3,923 | 258 KB | everything that survives default filtering, 358 measurements |
 
-Roughly 64 bytes per model all-in: the 32-byte record plus its share of the
-string table.
+Roughly 67 bytes per model all-in: the 32-byte record plus its share of the
+string table. The measurement and calibration sections add about 5.7 KB
+regardless of how many models are kept, since they scale with how many
+benchmarks exist, not with catalog size.

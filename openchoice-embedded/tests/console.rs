@@ -32,14 +32,24 @@ fn build(entries: &[(&str, u32, u32)]) -> Vec<u8> {
         records.push(128);
     }
 
+    let rec_off = HEADER_LEN as u32;
+    let str_off = rec_off + records.len() as u32;
+    let tail = str_off + strings.len() as u32;
+
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     out.extend_from_slice(&(RECORD_LEN as u16).to_le_bytes());
     out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-    out.extend_from_slice(&(HEADER_LEN as u32).to_le_bytes());
-    out.extend_from_slice(&((HEADER_LEN + records.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&rec_off.to_le_bytes());
+    out.extend_from_slice(&str_off.to_le_bytes());
     out.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+    // No measurements or calibrations: the console must work on a catalog
+    // that carries none, which is what a freshly packed one looks like.
+    out.extend_from_slice(&tail.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&tail.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&records);
